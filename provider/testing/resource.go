@@ -3,6 +3,7 @@ package testing
 import (
 	"context"
 	"fmt"
+	"log"
 	"os"
 	"strconv"
 	"strings"
@@ -22,6 +23,8 @@ import (
 	"github.com/georgysavva/scany/pgxscan"
 	"github.com/hashicorp/go-hclog"
 	"github.com/stretchr/testify/assert"
+	"github.com/testcontainers/testcontainers-go"
+	"github.com/testcontainers/testcontainers-go/wait"
 )
 
 type ResourceTestCase struct {
@@ -46,10 +49,13 @@ type testResourceSender struct {
 	Errors []string
 }
 
+type CloseFunc func()
+
 var (
 	dbConnOnce sync.Once
 	pool       execution.QueryExecer
 	dbErr      error
+	pgCloser   CloseFunc
 )
 
 func init() {
@@ -66,10 +72,11 @@ func TestResource(t *testing.T, resource ResourceTestCase) {
 	// No need for configuration or db connection, get it out of the way first
 	// testTableIdentifiersForProvider(t, resource.Provider)
 
-	conn, err := setupDatabase()
+	conn, closeDB, err := setupDatabase()
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer closeDB()
 
 	l := testlog.New(t)
 	l.SetLevel(hclog.Info)
@@ -254,14 +261,52 @@ func (f *testResourceSender) Send(r *cqproto.FetchResourcesResponse) error {
 	return nil
 }
 
-func setupDatabase() (execution.QueryExecer, error) {
+func setupDatabase() (execution.QueryExecer, CloseFunc, error) {
 	dbConnOnce.Do(func() {
-		pool, dbErr = database.New(context.Background(), hclog.NewNullLogger(), getEnv("DATABASE_URL", "host=localhost user=postgres password=pass DB.name=postgres port=5432"))
+		ctx := context.Background()
+		req := testcontainers.ContainerRequest{
+			Image:        "postgres:13.3-alpine",
+			ExposedPorts: []string{"5432/tcp"},
+			AutoRemove:   true,
+			Env: map[string]string{
+				"POSTGRES_USER":     "postgres",
+				"POSTGRES_PASSWORD": "postgres",
+				"POSTGRES_DB":       "postgres",
+			},
+			WaitingFor: wait.ForLog("database system is ready to accept connections"),
+		}
+		pgContainer, pgErr := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
+			ContainerRequest: req,
+			Started:          true,
+		})
+		if pgErr != nil {
+			dbErr = pgErr
+			return
+		}
+		pgCloser = func() {
+			pgContainer.Terminate(ctx)
+		}
+
+		host, err := pgContainer.Host(ctx)
+		if err != nil {
+			dbErr = err
+			return
+		}
+
+		port, err := pgContainer.MappedPort(ctx, "5432/tcp")
+		if err != nil {
+			dbErr = err
+			return
+		}
+
+		log.Println("HOST", host, "PORT", port.Int())
+		connStr := fmt.Sprintf("host=%s user=postgres password=postgres database=postgres port=%d", host, port.Int())
+		pool, dbErr = database.New(context.Background(), hclog.NewNullLogger(), getEnv("DATABASE_URL", connStr))
 		if dbErr != nil {
 			return
 		}
 	})
-	return pool, dbErr
+	return pool, pgCloser, dbErr
 }
 
 func getEnv(key, fallback string) string {

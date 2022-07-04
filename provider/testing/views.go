@@ -21,10 +21,11 @@ type ViewTestCase struct {
 func HelperTestView(t *testing.T, resource ViewTestCase) {
 	t.Helper()
 
-	conn, err := setupDatabase()
+	conn, closeDB, err := setupDatabase()
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer closeDB()
 
 	l := testlog.New(t)
 	l.SetLevel(hclog.Info)
